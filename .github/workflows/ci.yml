@@ -1,43 +1,51 @@
-name: CI - Build, Scan, Push, Sign
+name: CI - Build, Scan, Push, Sign (hardened)
 
 on:
   push:
     branches: [ main ]
   pull_request:
 
+env:
+  IMAGE_NAME: hardened-health
+  IMAGE_TAG: ${{ github.sha }}
+  IMAGE_REF: ghcr.io/${{ github.repository_owner }}/hardened-health:${{ github.sha }}
+
 jobs:
   build-and-scan:
     runs-on: ubuntu-latest
-    env:
-      IMAGE: ghcr.io/${{ github.repository_owner }}/hardened-health:${{ github.sha }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up QEMU (for multi-arch if needed)
+      - name: Set up QEMU (for multi-arch builds)
         uses: docker/setup-qemu-action@v2
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v2
 
-      - name: Build image
+      - name: Build image (load into runner)
         uses: docker/build-push-action@v4
         with:
           context: .
           push: false
-          tags: ${{ env.IMAGE }}
+          load: true
+          tags: ${{ env.IMAGE_REF }}
 
-      - name: Run Trivy scan
-        uses: aquasecurity/trivy-action@v2
-        with:
-          image-ref: ${{ env.IMAGE }}
-          format: 'table'
-          exit-code: '1'   # fail the job on any vulnerabilities found (tunable)
+      - name: Install Trivy (CLI)
+        run: |
+          set -eux
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+          trivy --version
+
+      - name: Run Trivy image scan (fail on HIGH/CRITICAL)
+        run: |
+          set -eux
+          trivy image --quiet --severity HIGH,CRITICAL --exit-code 1 --format table ${{ env.IMAGE_REF }}
 
   push-and-sign:
     needs: build-and-scan
-    runs-on: ubuntu-latest
     if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -49,21 +57,32 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push
+      - name: Build and push image
         uses: docker/build-push-action@v4
         with:
           context: .
           push: true
-          tags: ghcr.io/${{ github.repository_owner }}/hardened-health:latest
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/hardened-health:latest
+            ghcr.io/${{ github.repository_owner }}/hardened-health:${{ github.sha }}
 
       - name: Install cosign
         run: |
-          COSIGN_VERSION=2.1.0
-          curl -sSL https://github.com/sigstore/cosign/releases/download/v${COSIGN_VERSION}/cosign-linux-amd64 -o /usr/local/bin/cosign
+          set -eux
+          COSIGN_VER="2.10.0"
+          curl -sSL "https://github.com/sigstore/cosign/releases/download/v${COSIGN_VER}/cosign-linux-amd64" -o /usr/local/bin/cosign
           chmod +x /usr/local/bin/cosign
+          cosign version
 
-      - name: Sign image with cosign (keyless)
+      - name: Sign image with cosign (keyless OIDC)
         env:
           COSIGN_EXPERIMENTAL: "1"
         run: |
+          set -eux
           cosign sign --keyless ghcr.io/${{ github.repository_owner }}/hardened-health:latest
+
+      - name: Verify signature
+        run: |
+          set -eux
+          cosign verify --keyless ghcr.io/${{ github.repository_owner }}/hardened-health:latest
+
